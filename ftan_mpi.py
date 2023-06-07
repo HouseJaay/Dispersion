@@ -90,7 +90,7 @@ def phase_image(par, time, signal, samplef, dist):
         lc = 1.0 / (periods[ip]+w)
         hc = 1.0 / (periods[ip]-w)
         taps = firwin(numtaps, [lc, hc], window=('kaiser', beta), fs=samplef, pass_zero='bandpass')
-        print(len(taps), len(signal))
+        # print(len(taps), len(signal))
         signal_filtered = filtfilt(taps, 1, signal, padtype=None)
         signal_filtered /= np.max(signal_filtered)
         image[ip, :] = signal_filtered
@@ -127,6 +127,10 @@ def search_image(par, Img, Vels):
     maxarr = np.zeros(len(periods))
     init_idx1 = find_nearest(periods, par.init_per)
     init_idx2 = find_nearest(Vels[init_idx1], par.init_phav)
+    if init_idx2 >= len(Vels[init_idx1])-1:
+        return False, maxarr
+    if np.any(np.isnan(Img)):
+        return False, maxarr
     prev_idx2 = init_idx2
     for ip in np.arange(init_idx1, len(periods)):
         isgood, idx = nearest_max(Img[ip], prev_idx2)
@@ -139,7 +143,7 @@ def search_image(par, Img, Vels):
         if isgood:
             maxarr[ip] = Vels[ip, idx]
             prev_idx2 = idx
-    return maxarr
+    return True, maxarr
 
 def plot_phase_image(P, V, Img, out):
     import matplotlib as mpl
@@ -165,6 +169,8 @@ n_inputs = len(all_inputs)
 for ick in range(rank, n_inputs, size):
     fpath = all_inputs[ick]
     data, dist = read_data(fpath)
+    if dist < par.min_dist:
+        continue
     time = data[:,0]
     delta = time[1] - time[0]
     samplef = 1.0 / delta
@@ -178,7 +184,9 @@ for ick in range(rank, n_inputs, size):
     stack_egf *= window
     P, VP, PhaImg = phase_image(par, time[n1:n2], stack_egf[n1:n2], samplef, dist)
     P2, VG, GrpImg = envelope_image(par, time[n1:n2], stack_egf[n1:n2], delta, dist)
-    pha_vels = search_image(par, PhaImg, VP)
+    is_good, pha_vels = search_image(par, PhaImg, VP)
+    if not is_good:
+        continue
     op = join(par.output_path, basename(fpath)+'.disp')
     oip = join(par.fig_path, basename(fpath))
     np.savetxt(op, np.c_[periods, pha_vels])
