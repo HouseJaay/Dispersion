@@ -1,9 +1,10 @@
 import numpy as np
 import sys, os
 import importlib
-from scipy.signal import hilbert, kaiserord, firwin, filtfilt
+from scipy.signal import hilbert, kaiserord, firwin, filtfilt, freqz
+from scipy.signal.windows import tukey
 from scipy.interpolate import interp1d
-from scipy import fftpack
+import scipy.fft as fftpack
 from obspy.geodetics.base import gps2dist_azimuth
 from glob import glob
 from os.path import join, basename
@@ -78,7 +79,12 @@ def envelope_image(par, time, signal, delta, dist):
         image[ip, :] = env_f[:npts]
     return P, VG, image
 
-def phase_image(par, time, signal, samplef, dist):
+def phase_image_time_domain(par, time, signal, samplef, dist):
+    """
+    Deprecated
+    low efficiency
+    should pad signal when filter has comparable points as the signal
+    """
     periods = par.periods
     numtaps, beta = kaiserord(par.ripple, par.width/(0.5*samplef))
     image = np.zeros([len(periods), len(signal)])
@@ -92,6 +98,31 @@ def phase_image(par, time, signal, samplef, dist):
         taps = firwin(numtaps, [lc, hc], window=('kaiser', beta), fs=samplef, pass_zero='bandpass')
         # print(len(taps), len(signal))
         signal_filtered = filtfilt(taps, 1, signal, padtype=None)
+        signal_filtered /= np.max(signal_filtered)
+        image[ip, :] = signal_filtered
+    return P, VP, image
+
+def phase_image(par, time, signal, samplef, dist):
+    periods = par.periods
+    numtaps, beta = kaiserord(par.ripple, par.width/(0.5*samplef))
+    npts = len(signal)
+    nfft = fftpack.next_fast_len(npts+numtaps)
+    freqs = fftpack.rfftfreq(nfft, 1/samplef)
+    image = np.zeros([len(periods), len(signal)])
+    P, T = np.meshgrid(periods, time, indexing='ij')
+    VP = dist / (T - P/8)
+    taper_window = tukey(npts, alpha=0.1)
+    signal *= taper_window
+    signal_fft = fftpack.rfft(signal, nfft)
+    for ip in range(len(periods)):
+        cf = 1.0 / periods[ip]
+        w = par.band_pass_width / 2.0
+        lc = 1.0 / (periods[ip]+w)
+        hc = 1.0 / (periods[ip]-w)
+        taps = firwin(numtaps, [lc, hc], window=('kaiser', beta), fs=samplef, pass_zero='bandpass')
+        _, response = freqz(taps, worN=freqs, fs=samplef)
+        signal_fft_filtered = signal_fft * np.abs(response)**2
+        signal_filtered = np.real(fftpack.irfft(signal_fft_filtered))[:npts]
         signal_filtered /= np.max(signal_filtered)
         image[ip, :] = signal_filtered
     return P, VP, image
@@ -123,6 +154,31 @@ def find_nearest(array, value):
     return idx
 
 def search_image(par, Img, Vels):
+    if par.search_strategy == 'point':
+        return search_image_point(par, Img, Vels)
+    elif par.search_strategy == 'ref_curve':
+        return search_image_refcurve(par, Img, Vels)
+
+def search_image_refcurve(par, Img, Vels):
+    periods = par.periods
+    maxarr = np.zeros(len(periods))
+    if np.any(np.isnan(Img)):
+        return False, maxarr
+    tmp = np.loadtxt(par.ref_disp_path)
+    func = interp1d(tmp[:,0], tmp[:,1])
+    refv = func(periods)
+    # print("Reference dispersion curve:")
+    # with np.printoptions(precision=3):
+    #     print(periods)
+    #     print(refv)
+    for p_idx in range(len(periods)):
+        refv_idx = find_nearest(Vels[p_idx], refv[p_idx])
+        isgood, idx = nearest_max(Img[p_idx], refv_idx)
+        if isgood:
+            maxarr[p_idx] = Vels[p_idx, idx]
+    return True, maxarr
+
+def search_image_point(par, Img, Vels):
     periods = par.periods
     maxarr = np.zeros(len(periods))
     init_idx1 = find_nearest(periods, par.init_per)
@@ -145,13 +201,23 @@ def search_image(par, Img, Vels):
             prev_idx2 = idx
     return True, maxarr
 
-def plot_phase_image(P, V, Img, out):
+def plot_phase_image(par, P, V, Img, pha_vels, out):
     import matplotlib as mpl
     mpl.use('Agg')
     import matplotlib.pyplot as plt
 
+    periods = par.periods
+    if par.search_strategy == 'ref_curve':
+        tmp = np.loadtxt(par.ref_disp_path)
+        func = interp1d(tmp[:,0], tmp[:,1])
+        refv = func(periods)
     fig, ax = plt.subplots()
+    fig.suptitle('dist %.2f km' % (dist))
     ax.contourf(P, V, Img, levels=50, cmap='viridis')
+    ax.plot(periods, refv, color='tab:red', marker='.')
+    ax.plot(periods, pha_vels, color='tab:blue', marker='.')
+    ax.plot(periods, dist/par.min_lambda_ratio/periods, color='white')
+    ax.set_ylim(par.minv, par.maxv)
     plt.savefig(out + '.png')
     plt.close()
 
@@ -183,7 +249,7 @@ for ick in range(rank, n_inputs, size):
     noise = stack_egf[n2:]
     stack_egf *= window
     P, VP, PhaImg = phase_image(par, time[n1:n2], stack_egf[n1:n2], samplef, dist)
-    P2, VG, GrpImg = envelope_image(par, time[n1:n2], stack_egf[n1:n2], delta, dist)
+    # P2, VG, GrpImg = envelope_image(par, time[n1:n2], stack_egf[n1:n2], delta, dist)
     is_good, pha_vels = search_image(par, PhaImg, VP)
     if not is_good:
         continue
@@ -191,8 +257,8 @@ for ick in range(rank, n_inputs, size):
     oip = join(par.fig_path, basename(fpath))
     np.savetxt(op, np.c_[periods, pha_vels])
     if par.is_save_fig:
-        plot_phase_image(P, VP, PhaImg, oip)
-        plot_phase_image(P2, VG, GrpImg, oip+'.gv')
+        plot_phase_image(par, P, VP, PhaImg, pha_vels, oip)
+        # plot_phase_image(par, P2, VG, GrpImg, oip+'.gv')
 
 comm.barrier()
 if rank == 0:
