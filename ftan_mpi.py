@@ -110,7 +110,9 @@ def phase_image(par, time, signal, samplef, dist):
     freqs = fftpack.rfftfreq(nfft, 1/samplef)
     image = np.zeros([len(periods), len(signal)])
     P, T = np.meshgrid(periods, time, indexing='ij')
+    #TODO doublecheck
     VP = dist / (T - P/8)
+    # VP = dist / T
     taper_window = tukey(npts, alpha=0.1)
     signal *= taper_window
     signal_fft = fftpack.rfft(signal, nfft)
@@ -207,14 +209,14 @@ def plot_phase_image(par, P, V, Img, pha_vels, out):
     import matplotlib.pyplot as plt
 
     periods = par.periods
+    fig, ax = plt.subplots()
+    fig.suptitle('dist %.2f km' % (dist))
+    ax.pcolormesh(P, V, Img, cmap='viridis')
     if par.search_strategy == 'ref_curve':
         tmp = np.loadtxt(par.ref_disp_path)
         func = interp1d(tmp[:,0], tmp[:,1])
         refv = func(periods)
-    fig, ax = plt.subplots()
-    fig.suptitle('dist %.2f km' % (dist))
-    ax.contourf(P, V, Img, levels=50, cmap='viridis')
-    ax.plot(periods, refv, color='tab:red', marker='.')
+        ax.plot(periods, refv, color='tab:red', marker='.')
     ax.plot(periods, pha_vels, color='tab:blue', marker='.')
     ax.plot(periods, dist/par.min_lambda_ratio/periods, color='white')
     ax.set_ylim(par.minv, par.maxv)
