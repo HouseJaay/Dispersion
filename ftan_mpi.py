@@ -208,6 +208,7 @@ def plot_phase_image(par, P, V, Img, pha_vels, out):
     mpl.use('Agg')
     import matplotlib.pyplot as plt
 
+    #TODO plot snr at each period and threshold
     periods = par.periods
     fig, ax = plt.subplots()
     fig.suptitle('dist %.2f km' % (dist))
@@ -246,13 +247,15 @@ for ick in range(rank, n_inputs, size):
     n2 = int(dist/par.minv/delta)
     if n2 > len(time)-1:
         n2 = len(time)-1
-    window = cos_window(len(time), n1, n2)
+    # window = cos_window(len(time), n1, n2)
     stack_egf = data[:,1] + data[:,2]
-    noise = stack_egf[n2:]
-    stack_egf *= window
-    P, VP, PhaImg = phase_image(par, time[n1:n2], stack_egf[n1:n2], samplef, dist)
+    # noise = stack_egf[n2:]
+    # stack_egf *= window
+    #TODO calculate snr, check the noise window length
+    P, VP, PhaImg = phase_image(par, time, stack_egf, samplef, dist)
     # P2, VG, GrpImg = envelope_image(par, time[n1:n2], stack_egf[n1:n2], delta, dist)
     is_good, pha_vels = search_image(par, PhaImg, VP)
+    #TODO filter pha_vels by interstation distance
     if not is_good:
         continue
     op = join(par.output_path, basename(fpath)+'.disp')
