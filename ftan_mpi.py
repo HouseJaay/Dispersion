@@ -125,7 +125,6 @@ def phase_image(par, time, signal, samplef, dist):
         _, response = freqz(taps, worN=freqs, fs=samplef)
         signal_fft_filtered = signal_fft * np.abs(response)**2
         signal_filtered = np.real(fftpack.irfft(signal_fft_filtered))[:npts]
-        signal_filtered /= np.max(signal_filtered)
         image[ip, :] = signal_filtered
     return P, VP, image
 
@@ -208,10 +207,12 @@ def plot_phase_image(par, P, V, Img, pha_vels, out):
     mpl.use('Agg')
     import matplotlib.pyplot as plt
 
-    #TODO plot snr at each period and threshold
     periods = par.periods
-    fig, ax = plt.subplots()
+    fig = plt.figure()
     fig.suptitle('dist %.2f km' % (dist))
+    gs = fig.add_gridspec(nrows=2, ncols=1, height_ratios=(1,4))
+    ax = fig.add_subplot(gs[1])
+    Img = (Img.transpose() / np.max(Img, axis=1)).transpose()
     ax.pcolormesh(P, V, Img, cmap='viridis')
     if par.search_strategy == 'ref_curve':
         tmp = np.loadtxt(par.ref_disp_path)
@@ -219,10 +220,19 @@ def plot_phase_image(par, P, V, Img, pha_vels, out):
         refv = func(periods)
         ax.plot(periods, refv, color='tab:red', marker='.')
     ax.plot(periods, pha_vels, color='tab:blue', marker='.')
+    ax.plot(periods[~mask], pha_vels[~mask], color='tab:red', marker='.', linestyle='none')
     ax.plot(periods, dist/par.min_lambda_ratio/periods, color='white')
-    ax.set_ylim(par.minv, par.maxv)
+    ax.set_ylim(par.minv+0.1, par.maxv-0.1)
+
+    ax_snr = fig.add_subplot(gs[0])
+    ax_snr.plot(periods, snr, color='tab:blue', marker='.')
+    ax_snr.axhline(y=par.min_snr, color='tab:red', linestyle='dashed')
+    fig.tight_layout()
     plt.savefig(out + '.png')
     plt.close()
+
+def rms(data):
+        return np.sqrt(data.dot(data)/data.size)
 
 if rank == 0:
     all_inputs = glob(join(par.input_path, "*.dat"))
@@ -245,22 +255,29 @@ for ick in range(rank, n_inputs, size):
     samplef = 1.0 / delta
     n1 = int(dist/par.maxv/delta)
     n2 = int(dist/par.minv/delta)
-    if n2 > len(time)-1:
-        n2 = len(time)-1
-    # window = cos_window(len(time), n1, n2)
+    if n2 > len(time)-100:
+        raise ValueError("Don't have enough noise window")
     stack_egf = data[:,1] + data[:,2]
-    # noise = stack_egf[n2:]
-    # stack_egf *= window
-    #TODO calculate snr, check the noise window length
-    P, VP, PhaImg = phase_image(par, time, stack_egf, samplef, dist)
+    P, VP, PhaImg = phase_image(par, time[n1:n2], stack_egf[n1:n2], samplef, dist)
+    _, __, NoiseImg = phase_image(par, time[n2:], stack_egf[n2:], samplef, dist)
     # P2, VG, GrpImg = envelope_image(par, time[n1:n2], stack_egf[n1:n2], delta, dist)
     is_good, pha_vels = search_image(par, PhaImg, VP)
-    #TODO filter pha_vels by interstation distance
     if not is_good:
         continue
+    snr = np.zeros(len(periods))
+    for ip in range(len(periods)):
+        signal = PhaImg[ip]
+        noise = NoiseImg[ip]
+        snr[ip] = rms(signal) / rms(noise)
+
+    # phase_velocity < distance / (ratio*period)
+    mask1 = pha_vels < dist / (par.min_lambda_ratio*periods)
+    mask2 = snr > par.min_snr
+    mask = mask1 & mask2
+
     op = join(par.output_path, basename(fpath)+'.disp')
     oip = join(par.fig_path, basename(fpath))
-    np.savetxt(op, np.c_[periods, pha_vels])
+    np.savetxt(op, np.c_[periods, pha_vels, mask])
     if par.is_save_fig:
         plot_phase_image(par, P, VP, PhaImg, pha_vels, oip)
         # plot_phase_image(par, P2, VG, GrpImg, oip+'.gv')
