@@ -155,6 +155,8 @@ def find_nearest(array, value):
     return idx
 
 def search_image(par, Img, Vels):
+    if Img.size == 0:
+        return False, False
     if par.search_strategy == 'point':
         return search_image_point(par, Img, Vels)
     elif par.search_strategy == 'ref_curve':
