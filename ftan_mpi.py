@@ -30,8 +30,14 @@ par = importlib.import_module(proj_name + '.ftan_parameters')
 def read_data(fpath):
     with open(fpath, 'r') as f:
         tmp = (f.readline()).split()
+        if len(tmp) == 2:
+            elev1, elev2 = 0, 0
+        elif len(tmp) == 3:
+            elev1 = float(tmp[2])
         lon1, lat1 = float(tmp[0]), float(tmp[1])
         tmp = (f.readline()).split()
+        if len(tmp) == 3:
+            elev2 = float(tmp[2])
         lon2, lat2 = float(tmp[0]), float(tmp[1])
     data = np.loadtxt(fpath, skiprows=2)
     maxamp = np.max(data[:,[1,2]])
@@ -41,6 +47,8 @@ def read_data(fpath):
         data[:,1] = np.imag(hilbert(data[:,1]))
         data[:,2] = np.imag(hilbert(data[:,2]))
     d, _, __ = gps2dist_azimuth(lat1, lon1, lat2, lon2)
+    # correct elevation
+    d = (d**2 + (elev1-elev2)**2)**0.5
     dist = d / 1000.0
     return data, dist
 
@@ -233,6 +241,19 @@ def plot_phase_image(par, P, V, Img, pha_vels, out):
     plt.savefig(out + '.png')
     plt.close()
 
+def save_phase_image(par, P, VP, PhaImg, savepath):
+    from scipy.interpolate import griddata
+    # Normalize
+    PhaImg = (PhaImg.transpose() / np.max(PhaImg, axis=1)).transpose()
+    # Interpolation
+    iP, iV = np.meshgrid(par.periods, par.save_img_vels, indexing='ij')
+    PhaImg_interp = griddata((P.ravel(), VP.ravel()), 
+             PhaImg.ravel(), 
+             (iP.ravel(), iV.ravel())
+             )
+    # Save
+    np.savetxt(savepath, PhaImg_interp.reshape(iP.shape))
+
 def rms(data):
         return np.sqrt(data.dot(data)/data.size)
 
@@ -262,7 +283,7 @@ for ick in range(rank, n_inputs, size):
     stack_egf = data[:,1] + data[:,2]
     P, VP, PhaImg = phase_image(par, time[n1:n2], stack_egf[n1:n2], samplef, dist)
     _, __, NoiseImg = phase_image(par, time[n2:], stack_egf[n2:], samplef, dist)
-    # P2, VG, GrpImg = envelope_image(par, time[n1:n2], stack_egf[n1:n2], delta, dist)
+    P2, VG, GrpImg = envelope_image(par, time[n1:n2], stack_egf[n1:n2], delta, dist)
     is_good, pha_vels = search_image(par, PhaImg, VP)
     if not is_good:
         continue
@@ -283,6 +304,11 @@ for ick in range(rank, n_inputs, size):
     if par.is_save_fig:
         plot_phase_image(par, P, VP, PhaImg, pha_vels, oip)
         # plot_phase_image(par, P2, VG, GrpImg, oip+'.gv')
+    if par.is_save_phase_img:
+        save_phase_image(par, P, VP, PhaImg, 
+                         join(par.output_path, basename(fpath)+'.pdisp'))
+        save_phase_image(par, P2, VG, GrpImg, 
+                         join(par.output_path, basename(fpath)+'.gdisp'))
 
 comm.barrier()
 if rank == 0:
