@@ -83,7 +83,7 @@ def envelope_image(par, time, signal, delta, dist):
         gs = gauss_window(alpha, freqs, cf)
         signal_f = fftpack.irfft(fft * gs, nfft)
         env_f = np.abs(hilbert(signal_f))
-        env_f /= np.max(env_f)
+        # env_f /= np.max(env_f)
         image[ip, :] = env_f[:npts]
     return P, VG, image
 
@@ -136,6 +136,31 @@ def phase_image(par, time, signal, samplef, dist):
         image[ip, :] = signal_filtered
     return P, VP, image
 
+def phase_image_tvf(par, time, signal, samplef, dist, wins):
+    periods = par.periods
+    numtaps, beta = kaiserord(par.ripple, par.width/(0.5*samplef))
+    npts = len(signal)
+    nfft = fftpack.next_fast_len(npts+numtaps)
+    freqs = fftpack.rfftfreq(nfft, 1/samplef)
+    taper_window = tukey(npts, alpha=0.1)
+    signal *= taper_window
+    image = np.zeros([len(periods), len(signal)])
+    P, T = np.meshgrid(periods, time, indexing='ij')
+    #TODO doublecheck
+    VP = dist / (T - P/8)
+    for ip in range(len(periods)):
+        signalw = signal * wins[ip]
+        signal_fft = fftpack.rfft(signalw, nfft)
+        w = par.band_pass_width / 2.0
+        lc = 1.0 / (periods[ip]+w)
+        hc = 1.0 / (periods[ip]-w)
+        taps = firwin(numtaps, [lc, hc], window=('kaiser', beta), fs=samplef, pass_zero='bandpass')
+        _, response = freqz(taps, worN=freqs, fs=samplef)
+        signal_fft_filtered = signal_fft * np.abs(response)**2
+        signal_filtered = np.real(fftpack.irfft(signal_fft_filtered))[:npts]
+        image[ip, :] = signal_filtered
+    return P, VP, image
+
 def nearest_max(data, ini):
     """
     Find index of nearest max
@@ -162,7 +187,15 @@ def find_nearest(array, value):
     idx = (np.abs(array - value)).argmin()
     return idx
 
-def search_image(par, Img, Vels):
+def search_image_group(par, Img, Vels):
+    if Img.size == 0:
+        return False, False
+    if par.search_strategy == 'point':
+        return search_image_point(par, Img, Vels)
+    elif par.search_strategy == 'ref_curve':
+        return search_image_refcurve(par, Img, Vels)
+    
+def search_image_phase(par, Img, Vels):
     if Img.size == 0:
         return False, False
     if par.search_strategy == 'point':
@@ -223,6 +256,7 @@ def plot_phase_image(par, P, V, Img, pha_vels, out):
     gs = fig.add_gridspec(nrows=2, ncols=1, height_ratios=(1,4))
     ax = fig.add_subplot(gs[1])
     Img = (Img.transpose() / np.max(Img, axis=1)).transpose()
+    ax.set_ylim(par.minv+0.1, par.maxv-0.1)
     ax.pcolormesh(P, V, Img, cmap='viridis')
     if par.search_strategy == 'ref_curve':
         tmp = np.loadtxt(par.ref_disp_path)
@@ -232,7 +266,6 @@ def plot_phase_image(par, P, V, Img, pha_vels, out):
     ax.plot(periods, pha_vels, color='tab:blue', marker='.')
     ax.plot(periods[~mask], pha_vels[~mask], color='tab:red', marker='.', linestyle='none')
     ax.plot(periods, dist/par.min_lambda_ratio/periods, color='white')
-    ax.set_ylim(par.minv+0.1, par.maxv-0.1)
 
     ax_snr = fig.add_subplot(gs[0])
     ax_snr.plot(periods, snr, color='tab:blue', marker='.')
@@ -256,6 +289,24 @@ def save_phase_image(par, P, VP, PhaImg, savepath):
 
 def rms(data):
         return np.sqrt(data.dot(data)/data.size)
+
+def calc_phase_window(par, npts, periods, grp_vels, dist, delta):
+    nper = len(periods)
+    wins = np.ones((nper, npts))
+    tg = dist / grp_vels
+    for ip in range(nper):
+        win_hlen = periods[ip] * par.tvf_ratio / 2.0
+        if np.isinf(tg[ip]):
+            n1, n2 = 0, npts-1
+        else:
+            n1 = int((tg[ip] - win_hlen)/delta)
+            n2 = int((tg[ip] + win_hlen)/delta)
+        if n1 < 0:
+            n1 = 0
+        if n2 > npts-1:
+            n2 = npts - 1
+        wins[ip] = cos_window(npts, n1, n2)
+    return wins
 
 if rank == 0:
     all_inputs = glob(join(par.input_path, "*.dat"))
@@ -281,34 +332,42 @@ for ick in range(rank, n_inputs, size):
     if n2 > len(time)-100:
         raise ValueError("Don't have enough noise window")
     stack_egf = data[:,1] + data[:,2]
-    P, VP, PhaImg = phase_image(par, time[n1:n2], stack_egf[n1:n2], samplef, dist)
-    _, __, NoiseImg = phase_image(par, time[n2:], stack_egf[n2:], samplef, dist)
     P2, VG, GrpImg = envelope_image(par, time[n1:n2], stack_egf[n1:n2], delta, dist)
-    is_good, pha_vels = search_image(par, PhaImg, VP)
-    if not is_good:
+    is_good_g, grp_vels = search_image_group(par, GrpImg, VG)
+    _, __, NoiseImg = phase_image(par, time[n2:], stack_egf[n2:], samplef, dist)
+    # Time Variant Filter
+    if par.is_tvf:
+        wins = calc_phase_window(par, len(stack_egf), periods, grp_vels, dist, delta)
+        P, VP, PhaImg = phase_image_tvf(par, time[n1:n2], stack_egf[n1:n2], samplef, dist, wins[:, n1:n2])
+    else:
+        P, VP, PhaImg = phase_image(par, time[n1:n2], stack_egf[n1:n2], samplef, dist)
+    
+    is_good_p, pha_vels = search_image_phase(par, PhaImg, VP)
+    if not (is_good_p or is_good_g):
         continue
     snr = np.zeros(len(periods))
     for ip in range(len(periods)):
         signal = PhaImg[ip]
         noise = NoiseImg[ip]
-        snr[ip] = rms(signal) / rms(noise)
+        snr[ip] = np.max(signal) / rms(noise)
 
     # phase_velocity < distance / (ratio*period)
     mask1 = pha_vels < dist / (par.min_lambda_ratio*periods)
     mask2 = snr > par.min_snr
     mask = mask1 & mask2
 
-    op = join(par.output_path, basename(fpath)+'.disp')
+    op = join(par.output_path, basename(fpath))
     oip = join(par.fig_path, basename(fpath))
-    np.savetxt(op, np.c_[periods, pha_vels, mask])
+    np.savetxt(op+'.pdisp', np.c_[periods, pha_vels, mask])
+    np.savetxt(op+'.gdisp', np.c_[periods, grp_vels, mask])
     if par.is_save_fig:
         plot_phase_image(par, P, VP, PhaImg, pha_vels, oip)
-        # plot_phase_image(par, P2, VG, GrpImg, oip+'.gv')
+        plot_phase_image(par, P2, VG, GrpImg, grp_vels, oip+'.gv')
     if par.is_save_phase_img:
         save_phase_image(par, P, VP, PhaImg, 
-                         join(par.output_path, basename(fpath)+'.pdisp'))
+                         join(par.output_path, basename(fpath)+'.pimg'))
         save_phase_image(par, P2, VG, GrpImg, 
-                         join(par.output_path, basename(fpath)+'.gdisp'))
+                         join(par.output_path, basename(fpath)+'.gimg'))
 
 comm.barrier()
 if rank == 0:
