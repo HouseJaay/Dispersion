@@ -75,6 +75,8 @@ def envelope_image(par, time, signal, delta, dist):
     P, T = np.meshgrid(periods, time, indexing='ij')
     VG = dist / T
     npts = len(signal)
+    taper_window = tukey(npts, alpha=0.1)
+    signal *= taper_window
     nfft = fftpack.next_fast_len(len(signal))
     fft = fftpack.rfft(signal, nfft)
     freqs = fftpack.rfftfreq(nfft, delta)
@@ -334,6 +336,8 @@ for ick in range(rank, n_inputs, size):
     stack_egf = data[:,1] + data[:,2]
     P2, VG, GrpImg = envelope_image(par, time[n1:n2], stack_egf[n1:n2], delta, dist)
     is_good_g, grp_vels = search_image_group(par, GrpImg, VG)
+    #TODO read manually picked group velocity to define time variant filter
+    #规范输入和输出的文件名，根据文件名索引群速度频散曲线
     _, __, NoiseImg = phase_image(par, time[n2:], stack_egf[n2:], samplef, dist)
     # Time Variant Filter
     if par.is_tvf:
