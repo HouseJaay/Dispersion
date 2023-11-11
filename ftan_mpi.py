@@ -9,6 +9,7 @@ from obspy.geodetics.base import gps2dist_azimuth
 from glob import glob
 from os.path import join, basename
 from mpi4py import MPI
+import re
 
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
@@ -26,6 +27,12 @@ except IndexError:
 
 sys.path.append(proj_path)
 par = importlib.import_module(proj_name + '.ftan_parameters')
+
+def get_sta_name(fpath):
+    name = basename(fpath)
+    tmp = re.split(r'\.|-|_', name)
+    sta1, sta2 = tmp[1], tmp[2]
+    return sta1, sta2
 
 def read_data(fpath):
     with open(fpath, 'r') as f:
@@ -163,18 +170,22 @@ def phase_image_tvf(par, time, signal, samplef, dist, wins):
         image[ip, :] = signal_filtered
     return P, VP, image
 
-def nearest_max(data, ini):
+def nearest_max(data, ini, direction=None):
     """
     Find index of nearest max
     data: input array
     ini: initial index
+    direction: 1 or -1
     Return
     isgood: boolean
     index_max: int, result
     """
     if data[ini+1] == data[ini]:
         return (False, 0)
-    flag = int((data[ini+1] - data[ini]) / abs(data[ini+1] - data[ini]))
+    if direction is not None:
+        flag = int((data[ini+1] - data[ini]) / abs(data[ini+1] - data[ini]))
+    else:
+        flag = direction
     iprev = ini
     inext = ini + flag
     while data[inext] > data[iprev]:
@@ -235,26 +246,26 @@ def search_image_point(par, Img, Vels):
         return False, maxarr
     prev_idx2 = init_idx2
     for ip in np.arange(init_idx1, len(periods)):
-        isgood, idx = nearest_max(Img[ip], prev_idx2)
+        isgood, idx = nearest_max(Img[ip], prev_idx2, 1)
         if isgood:
             maxarr[ip] = Vels[ip, idx]
             prev_idx2 = idx
     prev_idx2 = init_idx2
     for ip in np.arange(init_idx1-1, -1, -1):
-        isgood, idx = nearest_max(Img[ip], prev_idx2)
+        isgood, idx = nearest_max(Img[ip], prev_idx2, -1)
         if isgood:
             maxarr[ip] = Vels[ip, idx]
             prev_idx2 = idx
     return True, maxarr
 
-def plot_phase_image(par, P, V, Img, pha_vels, out):
+def plot_phase_image(par, P, V, Img, pha_vels, label, out):
     import matplotlib as mpl
     mpl.use('Agg')
     import matplotlib.pyplot as plt
 
     periods = par.periods
     fig = plt.figure()
-    fig.suptitle('dist %.2f km' % (dist))
+    fig.suptitle('%s    dist %.2f km' % (label, dist))
     gs = fig.add_gridspec(nrows=2, ncols=1, height_ratios=(1,4))
     ax = fig.add_subplot(gs[1])
     Img = (Img.transpose() / np.max(Img, axis=1)).transpose()
@@ -268,10 +279,13 @@ def plot_phase_image(par, P, V, Img, pha_vels, out):
     ax.plot(periods, pha_vels, color='tab:blue', marker='.')
     ax.plot(periods[~mask], pha_vels[~mask], color='tab:red', marker='.', linestyle='none')
     ax.plot(periods, dist/par.min_lambda_ratio/periods, color='white')
+    ax.set_xlabel("Period (s)")
+    ax.set_ylabel("Velocity (km/s)")
 
     ax_snr = fig.add_subplot(gs[0])
     ax_snr.plot(periods, snr, color='tab:blue', marker='.')
     ax_snr.axhline(y=par.min_snr, color='tab:red', linestyle='dashed')
+    ax_snr.set_ylabel("SNR")
     fig.tight_layout()
     plt.savefig(out + '.png')
     plt.close()
@@ -310,6 +324,58 @@ def calc_phase_window(par, npts, periods, grp_vels, dist, delta):
         wins[ip] = cos_window(npts, n1, n2)
     return wins
 
+def fix_single_bad(arr):
+    """
+    This function takes a boolean array and modifies it such that if a False value
+    is found between two True values, it changes that False to True.
+    """
+    # Ensure the array has at least three elements to check for the pattern
+    if len(arr) < 3:
+        return arr
+
+    # Iterate through the array from the second element to the second-to-last
+    for i in range(1, len(arr) - 1):
+        if arr[i - 1] and not arr[i] and arr[i + 1]:
+            arr[i] = True
+
+    return arr
+
+def remove_single_good(arr):
+    """
+    This function takes a boolean array and modifies it such that if a True value
+    is found between two False values, it changes that True to False.
+    """
+    # Ensure the array has at least three elements to check for the pattern
+    if len(arr) < 3:
+        return arr
+
+    # Iterate through the array from the second element to the second-to-last
+    for i in range(1, len(arr) - 1):
+        if (not arr[i - 1]) and arr[i] and (not arr[i + 1]):
+            arr[i] = False
+
+    return arr
+
+def compare_adjacent(arr):
+    """
+    This function takes an array of floats and returns a boolean array of the same length.
+    For each element in the array, it checks if it's greater than or equal to the previous element.
+    If it is, the corresponding boolean value is True, otherwise False.
+    The first element is compared with the second element to determine its boolean value.
+    """
+    if len(arr) < 2:
+        # If the array is too short to compare, return an array of True (or False if empty)
+        return [True] * len(arr)
+
+    # Create the boolean array with the first element compared to the second
+    bool_arr = [arr[0] < arr[1]]
+
+    # Iterate through the array starting from the second element
+    for i in range(1, len(arr)):
+        bool_arr.append(arr[i] >= arr[i - 1])
+
+    return bool_arr
+
 if rank == 0:
     all_inputs = glob(join(par.input_path, "*.dat"))
     os.makedirs(par.output_path, exist_ok=True)
@@ -334,20 +400,27 @@ for ick in range(rank, n_inputs, size):
     if n2 > len(time)-100:
         raise ValueError("Don't have enough noise window")
     stack_egf = data[:,1] + data[:,2]
-    P2, VG, GrpImg = envelope_image(par, time[n1:n2], stack_egf[n1:n2], delta, dist)
-    is_good_g, grp_vels = search_image_group(par, GrpImg, VG)
-    #TODO read manually picked group velocity to define time variant filter
-    #规范输入和输出的文件名，根据文件名索引群速度频散曲线
     _, __, NoiseImg = phase_image(par, time[n2:], stack_egf[n2:], samplef, dist)
     # Time Variant Filter
     if par.is_tvf:
-        wins = calc_phase_window(par, len(stack_egf), periods, grp_vels, dist, delta)
-        P, VP, PhaImg = phase_image_tvf(par, time[n1:n2], stack_egf[n1:n2], samplef, dist, wins[:, n1:n2])
+        if par.tvf_strategy == 'auto':
+            P2, VG, GrpImg = envelope_image(par, time[n1:n2], stack_egf[n1:n2], delta, dist)
+            is_good_g, grp_vels = search_image_group(par, GrpImg, VG)
+            if not is_good_g:
+                continue
+            wins = calc_phase_window(par, len(stack_egf), periods, grp_vels, dist, delta)
+            P, VP, PhaImg = phase_image_tvf(par, time[n1:n2], stack_egf[n1:n2], samplef, dist, wins[:, n1:n2])
+        elif par.tvf_strategy == 'pre-defined':
+            tmp = np.loadtxt(par.path_to_pre_defined_grpvel)
+            func = interp1d(tmp[:,0], tmp[:,1])
+            refgv = func(periods)
+            wins = calc_phase_window(par, len(stack_egf), periods, refgv, dist, delta)
+            P, VP, PhaImg = phase_image_tvf(par, time[n1:n2], stack_egf[n1:n2], samplef, dist, wins[:, n1:n2])
     else:
         P, VP, PhaImg = phase_image(par, time[n1:n2], stack_egf[n1:n2], samplef, dist)
     
     is_good_p, pha_vels = search_image_phase(par, PhaImg, VP)
-    if not (is_good_p or is_good_g):
+    if not is_good_p:
         continue
     snr = np.zeros(len(periods))
     for ip in range(len(periods)):
@@ -357,21 +430,28 @@ for ick in range(rank, n_inputs, size):
 
     # phase_velocity < distance / (ratio*period)
     mask1 = pha_vels < dist / (par.min_lambda_ratio*periods)
+    # snr threshold
     mask2 = snr > par.min_snr
-    mask = mask1 & mask2
+    # exclude phase vel with negative derivative with frequency
+    mask3 = compare_adjacent(pha_vels)
+    mask = mask1 & mask2 & mask3
+    mask = fix_single_bad(mask)
+    mask = remove_single_good(mask)
 
     op = join(par.output_path, basename(fpath))
     oip = join(par.fig_path, basename(fpath))
     np.savetxt(op+'.pdisp', np.c_[periods, pha_vels, mask])
-    np.savetxt(op+'.gdisp', np.c_[periods, grp_vels, mask])
+    # np.savetxt(op+'.gdisp', np.c_[periods, grp_vels, mask])
     if par.is_save_fig:
-        plot_phase_image(par, P, VP, PhaImg, pha_vels, oip)
-        plot_phase_image(par, P2, VG, GrpImg, grp_vels, oip+'.gv')
+        sta1, sta2 = get_sta_name(fpath)
+        label = f"{sta1}-{sta2}"
+        plot_phase_image(par, P, VP, PhaImg, pha_vels, label, oip)
+        # plot_phase_image(par, P2, VG, GrpImg, grp_vels, label, oip+'.gv')
     if par.is_save_phase_img:
         save_phase_image(par, P, VP, PhaImg, 
                          join(par.output_path, basename(fpath)+'.pimg'))
-        save_phase_image(par, P2, VG, GrpImg, 
-                         join(par.output_path, basename(fpath)+'.gimg'))
+        # save_phase_image(par, P2, VG, GrpImg, 
+        #                  join(par.output_path, basename(fpath)+'.gimg'))
 
 comm.barrier()
 if rank == 0:
