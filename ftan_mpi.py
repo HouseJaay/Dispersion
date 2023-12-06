@@ -1,7 +1,7 @@
 import numpy as np
 import sys, os
 import importlib
-from scipy.signal import hilbert, kaiserord, firwin, filtfilt, freqz
+from scipy.signal import hilbert, kaiserord, firwin, filtfilt, freqz, argrelextrema
 from scipy.signal.windows import tukey
 from scipy.interpolate import interp1d
 import scipy.fft as fftpack
@@ -155,9 +155,23 @@ def phase_image_tvf(par, time, signal, samplef, dist, wins):
     signal *= taper_window
     image = np.zeros([len(periods), len(signal)])
     P, T = np.meshgrid(periods, time, indexing='ij')
-    #TODO doublecheck
+    # TODO doublecheck
     VP = dist / (T - P/8)
     for ip in range(len(periods)):
+        # first round filter, exclude higher order surface wave at higher frequency
+        amax = np.max(signal)
+        signal_fft = fftpack.rfft(signal, nfft)
+        hc = 1.0 / (periods[ip]*par.pre_lp_ratio)
+        cc = 1.0 / periods[ip]
+        hc = min(samplef/2, hc)
+        # TODO can we consider cut-off frequency here?
+        numtaps_lp, beta_lp = kaiserord(par.ripple, abs(cc-hc)/(0.5*samplef))
+        taps = firwin(numtaps_lp, hc, window=('kaiser', beta_lp), fs=samplef, pass_zero='lowpass')
+        _, response = freqz(taps, worN=freqs, fs=samplef)
+        signal_fft_filtered = signal_fft * np.abs(response)**2
+        signal = np.real(fftpack.irfft(signal_fft_filtered))[:npts]
+        signal *= amax / np.max(signal) 
+
         signalw = signal * wins[ip]
         signal_fft = fftpack.rfft(signalw, nfft)
         w = par.band_pass_width / 2.0
@@ -180,17 +194,21 @@ def nearest_max(data, ini, direction=None):
     isgood: boolean
     index_max: int, result
     """
+    if ini <= 0 or ini >= len(data)-1:
+        return (False, 0)
     if data[ini+1] == data[ini]:
         return (False, 0)
-    if direction is not None:
+    if direction is None:
         flag = int((data[ini+1] - data[ini]) / abs(data[ini+1] - data[ini]))
     else:
         flag = direction
-    iprev = ini
+    icur = ini
+    iprev = ini - flag
     inext = ini + flag
-    while data[inext] > data[iprev]:
+    while not (data[icur] > data[iprev] and data[icur] > data[inext]):
         iprev += flag
         inext += flag
+        icur += flag
         if inext > len(data)-1 or iprev < 0:
             return (False, 0)
     return (True, iprev)
@@ -246,16 +264,57 @@ def search_image_point(par, Img, Vels):
         return False, maxarr
     prev_idx2 = init_idx2
     for ip in np.arange(init_idx1, len(periods)):
-        isgood, idx = nearest_max(Img[ip], prev_idx2, 1)
+        isgood, idx = nearest_max(Img[ip], prev_idx2)
         if isgood:
             maxarr[ip] = Vels[ip, idx]
             prev_idx2 = idx
     prev_idx2 = init_idx2
     for ip in np.arange(init_idx1-1, -1, -1):
-        isgood, idx = nearest_max(Img[ip], prev_idx2, -1)
+        isgood, idx = nearest_max(Img[ip], prev_idx2+1)
         if isgood:
             maxarr[ip] = Vels[ip, idx]
             prev_idx2 = idx
+    return True, maxarr
+
+def search_image_point_smart(par, Img, Vels):
+    nv_merit = 5
+    periods = par.periods
+    maxarr = np.zeros(len(periods))
+    init_idx1 = find_nearest(periods, par.init_per)
+    init_idx2 = find_nearest(Vels[init_idx1], par.init_phav)
+    if init_idx2 >= len(Vels[init_idx1])-1:
+        return False, maxarr
+    if np.any(np.isnan(Img)):
+        return False, maxarr
+    prev_idx2 = init_idx2
+    for ip in np.arange(init_idx1, len(periods)):
+        idxs = argrelextrema(Img[ip], np.greater)[0]
+        arr = Vels[ip, idxs]
+        if len(arr) == 1:
+            idx = idxs[0]
+            maxarr[ip] = Vels[ip, idx]
+            prev_idx2 = idx
+        else:
+            filtered_indices = np.where(arr > Vels[ip, prev_idx2+nv_merit])[0]
+            if len(filtered_indices) > 0:
+                idx = idxs[filtered_indices[np.argmin(arr[filtered_indices])]]
+                maxarr[ip] = Vels[ip, idx]
+                prev_idx2 = idx
+
+    prev_idx2 = init_idx2
+    for ip in np.arange(init_idx1-1, -1, -1):
+        idxs = argrelextrema(Img[ip], np.greater)[0]
+        arr = Vels[ip, idxs]
+        if len(arr) == 1:
+            idx = idxs[0]
+            maxarr[ip] = Vels[ip, idx]
+            prev_idx2 = idx
+        else:
+            filtered_indices = np.where(arr < Vels[ip, prev_idx2-nv_merit])[0]
+            if len(filtered_indices) > 0:
+                idx = idxs[filtered_indices[np.argmax(arr[filtered_indices])]]
+                maxarr[ip] = Vels[ip, idx]
+                prev_idx2 = idx
     return True, maxarr
 
 def plot_phase_image(par, P, V, Img, pha_vels, label, out):
